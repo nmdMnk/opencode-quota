@@ -151,6 +151,51 @@ export function rpcErrorMessage(error: unknown): string {
   return String(error);
 }
 
+/** Retry only the outer RPC's transport, sharing the original minute-long deadline. */
+export async function retryQuotaCall<T>(
+  call: () => Promise<T>,
+  { signal }: QuotaRpcCallOptions,
+): Promise<T> {
+  const delays = [250, 750];
+  for (let attempt = 0; ; attempt += 1) {
+    signal.throwIfAborted();
+    try {
+      return await call();
+    } catch (error) {
+      signal.throwIfAborted();
+      // RPC application errors are not transport errors, regardless of their message.
+      const tagged = typeof error === "object" && error !== null;
+      const message = rpcErrorMessage(error);
+      if (
+        attempt >= delays.length ||
+        (tagged && "type" in error && error.type !== "transport" && error.type !== "Transport") ||
+        (tagged && "name" in error && /abort|timeout/i.test(String(error.name))) ||
+        /timed? ?out\b|timeout/i.test(message) ||
+        // The core network vocabulary, narrowed to transport messages. Do not import the
+        // server's classifier here: its redaction dependencies require Node in GUI bundles.
+        !/^(?:Transport:\s*)?(?:econn(?:reset|aborted|refused)\b|fetch failed\b|socket hang up\b)/i.test(
+          message,
+        )
+      ) {
+        throw error;
+      }
+      await new Promise<void>((resolve, reject) => {
+        const abort = () => {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", abort);
+          reject(signal.reason);
+        };
+        const timer = setTimeout(() => {
+          signal.removeEventListener("abort", abort);
+          resolve();
+        }, delays[attempt]);
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+      });
+    }
+  }
+}
+
 /** The toast for a failed call: its reason, cleaned for the terminal. */
 export function errorToast(error: unknown, title = "OpenCode Quota") {
   const message = sanitizeDisplayText(rpcErrorMessage(error));
@@ -353,7 +398,10 @@ export function createQuotaClient(
     try {
       const options = quotaCallOptions(host);
       directory = options.location?.directory ?? "";
-      request = rpc().snapshot(sessionID ? { sessionID } : {}, options);
+      request = retryQuotaCall(
+        () => rpc().snapshot(sessionID ? { sessionID } : {}, options),
+        options,
+      );
     } catch (error) {
       // A client without the RPC, or no folder to name: fail like a rejected call.
       request = Promise.reject(error);
@@ -456,7 +504,7 @@ export function createQuotaClient(
         const input: QuotaRpcRefreshInput = sessionID ? { reason, sessionID } : { reason };
         subscribe();
         const options = quotaCallOptions(host);
-        const output = await rpc().refresh(input, options);
+        const output = await retryQuotaCall(() => rpc().refresh(input, options), options);
         if (at !== mount) return undefined;
         apply(output.snapshot, options.location?.directory ?? "", {
           id: sessionID,

@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import type { QuotaSnapshot } from "../src/core/types.js";
-import { createQuotaClient, ownFolderEvents } from "../src/tui/client.js";
+import {
+  createQuotaClient,
+  ownFolderEvents,
+  retryQuotaCall,
+  type QuotaRpcCallOptions,
+} from "../src/tui/client.js";
 
 const NOW = Date.parse("2026-10-10T12:00:00.000Z");
 
@@ -19,7 +24,7 @@ function snapshot(revision: number, input = 0, serverId = "server-1"): QuotaSnap
 /** A quota RPC whose calls wait until the test answers them, oldest first or not. */
 function fakeRpc(own?: { directory: string }) {
   const waiting: Array<(snapshot: QuotaSnapshot) => void> = [];
-  const call = () =>
+  const call = (_input: unknown, _options: QuotaRpcCallOptions) =>
     new Promise<{ snapshot: QuotaSnapshot }>((resolve) =>
       waiting.push((answer) => resolve({ snapshot: answer })),
     );
@@ -422,5 +427,137 @@ describe("TUI quota client", () => {
       currentModelProviderIds: ["fresh"],
     });
     stop();
+  });
+});
+
+describe("TUI RPC transport retry", () => {
+  const reset = "Transport: ECONNRESET: The socket connection was closed unexpectedly";
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it.each([1, 2])("loads a snapshot after %i resets without reporting failure", async (resets) => {
+    vi.useFakeTimers();
+    const { host, rpc } = fakeRpc();
+    const failure = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = createQuotaClient(host, undefined, failure);
+    for (let index = 0; index < resets; index += 1) rpc.snapshot.mockRejectedValueOnce(reset);
+    rpc.snapshot.mockResolvedValueOnce({ snapshot: snapshot(1) });
+    client.watch("retry-session");
+    expect(rpc.snapshot).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(rpc.snapshot).toHaveBeenCalledTimes(2);
+    if (resets === 2) await vi.advanceTimersByTimeAsync(750);
+    expect(rpc.snapshot).toHaveBeenCalledTimes(resets + 1);
+    expect(client.snapshot("retry-session")).toMatchObject(snapshot(1));
+    expect(failure).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    const signals = rpc.snapshot.mock.calls.map((call) => call[1].signal);
+    expect(signals.every((signal) => signal === signals[0])).toBe(true);
+  });
+
+  it.each(["snapshot", "refresh"] as const)(
+    "reports the final %s failure once and retains last-good data",
+    async (method) => {
+      vi.useFakeTimers();
+      const { host, rpc } = fakeRpc();
+      const failure = vi.fn();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const client = createQuotaClient(host, undefined, failure);
+      rpc.refresh.mockResolvedValueOnce({ snapshot: snapshot(5) });
+      await client.refresh("manual");
+      const previous = client.snapshot();
+      const final = { message: reset };
+      rpc[method]
+        .mockRejectedValueOnce(reset)
+        .mockRejectedValueOnce(reset)
+        .mockRejectedValueOnce(final);
+      const request = method === "refresh" ? client.refresh("manual") : client.watch();
+      await vi.advanceTimersByTimeAsync(1000);
+      if (method === "refresh") expect(await request).toBeUndefined();
+      expect(rpc[method]).toHaveBeenCalledTimes(method === "refresh" ? 4 : 3);
+      expect(client.snapshot()).toEqual(previous);
+      expect(failure).toHaveBeenCalledExactlyOnceWith(final);
+      expect(warn).toHaveBeenCalledExactlyOnceWith(
+        `[opencode-quota] failed to load quota: ${reset}`,
+      );
+    },
+  );
+
+  it("refreshes after two transport resets", async () => {
+    vi.useFakeTimers();
+    const { client, rpc } = fakeRpc();
+    rpc.refresh.mockRejectedValueOnce(reset).mockRejectedValueOnce({ message: reset });
+    rpc.refresh.mockResolvedValueOnce({ snapshot: snapshot(2) });
+    const request = client.refresh("manual", "retry-session");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(await request).toMatchObject(snapshot(2));
+    expect(rpc.refresh).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    { type: "rpc.unavailable", message: reset },
+    { type: "rpc.validation", message: reset },
+    { type: "rpc.bad_request", message: reset },
+    { type: "auth", message: reset },
+    { type: "provider_error", message: reset },
+    new DOMException("ECONNRESET", "AbortError"),
+    new DOMException("ECONNRESET", "TimeoutError"),
+    new Error("Transport: request timed out: ECONNRESET"),
+    new Error("arbitrary failure"),
+  ])("does not retry a non-transport failure (%s)", async (error) => {
+    const call = vi.fn().mockRejectedValue(error);
+    await expect(retryQuotaCall(call, { signal: new AbortController().signal })).rejects.toBe(
+      error,
+    );
+    expect(call).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["ECONNREFUSED", "ECONNABORTED", "fetch failed", "socket hang up"])(
+    "retries equivalent core network transport failures (%s)",
+    async (message) => {
+      vi.useFakeTimers();
+      const call = vi.fn().mockRejectedValueOnce(new Error(message)).mockResolvedValueOnce("ok");
+      const request = retryQuotaCall(call, { signal: new AbortController().signal });
+      await vi.advanceTimersByTimeAsync(250);
+      expect(await request).toBe("ok");
+      expect(call).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("cancels during backoff immediately, without another attempt or timer", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const call = vi.fn().mockRejectedValue(reset);
+    const request = retryQuotaCall(call, { signal: controller.signal });
+    const error = new DOMException("Cancelled", "AbortError");
+    const result = expect(request).rejects.toBe(error);
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort(error);
+    await result;
+    expect(call).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not retry provider errors carried in a successful snapshot", async () => {
+    const { client, rpc } = fakeRpc();
+    const value = {
+      ...snapshot(1),
+      providers: [
+        {
+          providerId: "copilot",
+          label: "Quota",
+          refreshing: false,
+          rows: [],
+          error: { code: "network" as const, detail: reset },
+        },
+      ],
+    };
+    rpc.refresh.mockResolvedValueOnce({ snapshot: value });
+    expect(await client.refresh("manual", "retry-session")).toMatchObject(value);
+    expect(rpc.refresh).toHaveBeenCalledTimes(1);
   });
 });
