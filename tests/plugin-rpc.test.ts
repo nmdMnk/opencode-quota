@@ -819,6 +819,51 @@ describe("server quota RPC", () => {
     expect(JSON.stringify(enabled.emit.mock.calls)).not.toContain("exportPart");
   });
 
+  it("replaces the unavailable profile export after the checking session view is pruned", async () => {
+    const exportPath = join(folders.cacheDir, "quota-export.json");
+    useSettings({ system: { exportFile: true } });
+    let finish: (result: ReturnType<typeof copilotAnswer>) => void = () => {};
+    const fetch = vi.fn(
+      () =>
+        new Promise<ReturnType<typeof copilotAnswer>>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    mocks.getProviders.mockReturnValue([provider("copilot", fetch, ACCOUNT_NEUTRAL)]);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    const { call, emit } = await setupServer();
+    const running = call("refresh", { sessionID: "origin", reason: "manual" }) as Promise<{
+      snapshot: QuotaSnapshot;
+    }>;
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    await vi.waitFor(async () => {
+      expect(JSON.parse(await readFile(exportPath, "utf8"))).toMatchObject({
+        providers: { copilot: { status: "unavailable" } },
+      });
+    });
+    emit.mockClear();
+
+    // Advance only the store's clock, not the provider request timeout.
+    clock.mockReturnValue(Date.now() + 5 * 60_000);
+    finish(copilotAnswer(73));
+    expect((await running).snapshot.providers[0]?.rows[0]?.percentRemaining).toBe(73);
+    await vi.waitFor(async () => {
+      expect(JSON.parse(await readFile(exportPath, "utf8"))).toMatchObject({
+        providers: {
+          copilot: {
+            status: "ok",
+            entries: [{ id: "copilot.allowance", percentRemaining: 73 }],
+          },
+        },
+      });
+    });
+    await vi.waitFor(() => expect(emit).toHaveBeenCalledOnce());
+    const event = emit.mock.calls[0]?.[1] as { snapshot: QuotaSnapshot };
+    expect(event.snapshot).not.toHaveProperty("sessionID");
+    expect(event.snapshot.providers[0]?.rows[0]?.percentRemaining).toBe(73);
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
   it("downloads new prices whatever their age, and says when the settings keep the built-in ones", async () => {
     useSettings({ providers: { pricing: { source: "bundled", autoRefreshDays: 3 } } });
     // models.dev's reply, saved in the plugin's cache folder: gone after this test.

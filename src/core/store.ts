@@ -728,9 +728,9 @@ export function createQuotaStore(deps: QuotaStoreDeps): QuotaStore {
     );
   }
 
-  function emit(operation: Operation): void {
-    if (listeners.size === 0 || !isCurrent(operation)) return;
-    if (operation.sessionID && !sessions.has(operation.sessionID)) return;
+  function emit(operation: Operation): boolean {
+    if (listeners.size === 0 || !isCurrent(operation)) return false;
+    if (operation.sessionID && !sessions.has(operation.sessionID)) return false;
     heardProviders.set(operation.scope, providerIdsOf(operation));
     const snapshot = buildSnapshot(operation);
     for (const listener of listeners) {
@@ -740,6 +740,12 @@ export function createQuotaStore(deps: QuotaStoreDeps): QuotaStore {
         log(`a quota snapshot subscriber failed: ${errorMessage(error)}`);
       }
     }
+    return true;
+  }
+
+  /** A completed check still reaches profile subscribers after its session view goes away. */
+  function emitProfile(operation: Operation): void {
+    emit({ ...operation, sessionID: undefined, model: undefined });
   }
 
   function record(provider: StoreProvider, where: ResolvedKey, result: ProviderFetch): void {
@@ -853,9 +859,13 @@ export function createQuotaStore(deps: QuotaStoreDeps): QuotaStore {
     // Providers with the same identity share new rows across scopes; each view still reads
     // its own keys for providers whose credential source differs.
     forgetInactiveSessions();
+    let emitted = false;
     for (const view of views.values()) {
-      if (view.keys.get(providerKey)?.key === where.key) emit(view);
+      if (view.keys.get(providerKey)?.key === where.key) {
+        emitted = emit(view) || emitted;
+      }
     }
+    if (!emitted) emitProfile(operation);
     return true;
   }
 

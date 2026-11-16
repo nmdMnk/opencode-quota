@@ -246,6 +246,59 @@ describe("quota store", () => {
     expect(seen.map((snapshot) => snapshot.sessionID).sort()).toEqual(["active", "reopened"]);
   });
 
+  it.each([false, true])(
+    "emits one completed check snapshot when its session view is pruned: %s",
+    async (pruned) => {
+      const copilot = fakeProvider();
+      const pending = deferred<ProviderFetch>();
+      copilot.fetch.mockReturnValueOnce(pending.promise);
+      const store = createQuotaStore({
+        source: async () => ({
+          scope: "profile-credentials",
+          providers: [copilot.provider],
+          minIntervalMs: HOUR,
+          providerIdsForModel: () => ["copilot"],
+        }),
+        file: null,
+        now: () => clock,
+      });
+      stores.push(store);
+      const seen: QuotaSnapshot[] = [];
+      store.subscribe((snapshot) => seen.push(snapshot));
+      const running = store.refresh({
+        sessionID: "origin",
+        model: { id: "model", providerID: "copilot" },
+        reason: "manual",
+      });
+      await vi.waitFor(() => expect(copilot.fetch).toHaveBeenCalledOnce());
+      const scope = seen[0]?.sourceScope;
+      expect(scope).toEqual(expect.any(String));
+      expect(only(seen[0]!).rows).toEqual([]);
+      seen.length = 0;
+
+      if (pruned) clock += 5 * MINUTE;
+      pending.resolve(ok([row("allowance", 30)]));
+      const result = await running;
+
+      expect(only(result).rows).toEqual([row("allowance", 30)]);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]?.sourceScope).toBe(scope);
+      expect(only(seen[0]!)).toMatchObject({
+        rows: [row("allowance", 30)],
+        checkedAtMs: clock,
+        refreshing: false,
+      });
+      if (pruned) {
+        expect(seen[0]).not.toHaveProperty("sessionID");
+        expect(seen[0]).not.toHaveProperty("currentModelProviderIds");
+      } else {
+        expect(seen[0]?.sessionID).toBe("origin");
+        expect(seen[0]?.currentModelProviderIds).toEqual(["copilot"]);
+      }
+      expect(copilot.fetch).toHaveBeenCalledOnce();
+    },
+  );
+
   it("asks each provider once at a time", async () => {
     const copilot = fakeProvider();
     const pending = deferred<ProviderFetch>();
