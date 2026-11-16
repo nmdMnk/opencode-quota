@@ -7,7 +7,7 @@
  * check since the server started) is written from its snapshot.
  */
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { describeError } from "../core/errors.js";
 import type { CheckForExport } from "../core/store.js";
 import type { ProviderSnapshot, QuotaRow, QuotaSnapshot, QuotaWindow } from "../core/types.js";
@@ -46,16 +46,52 @@ const EXPORT_WINDOW_LABELS: Readonly<Record<QuotaWindow, string>> = {
 };
 
 /**
+ * The Claude account this process reads, from `CLAUDE_CONFIG_DIR`: "" for the default
+ * `~/.claude` (or no variable), else the sanitized folder name (`~/.claude-work` →
+ * `claude-work`). This scopes only the export filename, not the cache or credentials;
+ * identical sanitized folder names still share a file.
+ */
+export function claudeAccountScope(
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+): string {
+  const configured = env.CLAUDE_CONFIG_DIR?.trim();
+  if (!configured) return "";
+  const directory = resolve(
+    configured === "~"
+      ? home
+      : configured.startsWith("~/")
+        ? join(home, configured.slice(2))
+        : configured.startsWith("~\\")
+          ? join(home, ...configured.slice(2).split(/\\+/u))
+          : configured,
+  );
+  const fold = (path: string) => (process.platform === "win32" ? path.toLowerCase() : path);
+  if (fold(directory) === fold(resolve(home, ".claude"))) return "";
+  const name = basename(directory)
+    .replace(/^\.+/u, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/gu, "-")
+    .replace(/^-+|-+$/gu, "");
+  return name || "custom";
+}
+
+/**
  * Resolves the export file path from a configured value.
  *
- * - Empty string → XDG cache default: `$XDG_CACHE_HOME/opencode/quota-export.json`
+ * - Empty string → XDG cache default: `$XDG_CACHE_HOME/opencode/quota-export.json`, or
+ *   `quota-export.<account>.json` for a non-default Claude account (`claudeAccountScope`)
  * - Starts with `~/` → expands `~` to `homedir()`
  * - Starts with `~\` → expands `~` and treats backslashes as path separators
  * - Otherwise → returns as-is (caller is responsible for absolute paths)
  */
 export function resolveExportPath(configured: string): string {
   if (configured === "") {
-    return join(getOpencodeRuntimeDirs().cacheDir, "quota-export.json");
+    const scope = claudeAccountScope();
+    return join(
+      getOpencodeRuntimeDirs().cacheDir,
+      scope ? `quota-export.${scope}.json` : "quota-export.json",
+    );
   }
   if (configured.startsWith("~/")) {
     return join(homedir(), configured.slice(2));

@@ -40,7 +40,11 @@ For a status bar or another tool that checks quota often. Turn on **Quota file (
 { "system": { "exportFile": true } }
 ```
 
-The file is `~/.cache/opencode/quota-export.json` (`$XDG_CACHE_HOME/opencode/quota-export.json` when `XDG_CACHE_HOME` is set); `system.exportPath` changes it. OpenCode's background service rewrites it each time its quota changes, and it keeps its last contents when OpenCode stops.
+The file is `~/.cache/opencode/quota-export.json` (`$XDG_CACHE_HOME/opencode/quota-export.json` when `XDG_CACHE_HOME` is set). With an empty `system.exportPath`, the filename stays unchanged when `CLAUDE_CONFIG_DIR` is unset, blank, or the default `~/.claude` directory. A non-default directory uses `quota-export.<account>.json` in the same cache folder (`~/.claude-work` → `quota-export.claude-work.json`). An explicit `system.exportPath` takes precedence and is not account-scoped.
+
+For the filename, surrounding whitespace is trimmed, `~`, `~/` and `~\` expand to the home directory, and relative directories resolve from the process's working directory. The default-directory comparison ignores case on Windows. Trailing separators and `.`/`..` segments are normalized. `<account>` is the final folder name, with leading dots removed and letters lowercased; runs outside ASCII `a-z`, `0-9`, `_` and `-` become `-`, surrounding hyphens are removed, and an empty result becomes `custom` (including filesystem roots).
+
+Different scopes prevent processes from overwriting the same export file. This changes only the export filename, not credential lookup, the shared quota cache, or `show --json`. Identical folder names and names that sanitize to the same scope still share a file; use distinct explicit export paths when necessary, including for names too long for the filesystem. The examples below use the default filename; adjust it for your scope. OpenCode's background service rewrites the file each time its quota changes, and it keeps its last contents when OpenCode stops.
 
 <details>
 <summary><strong>tmux and Starship examples</strong></summary>

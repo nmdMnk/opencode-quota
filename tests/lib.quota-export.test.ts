@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, parse, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 // --------------- mock modules ---------------
@@ -18,6 +18,7 @@ import { writeJsonAtomic } from "../src/lib/atomic-json.js";
 import type { QuotaExport } from "../src/lib/quota-export-types.js";
 import {
   buildQuotaExportFromSnapshot,
+  claudeAccountScope,
   exportProviderFromCheck,
   resolveExportPath,
   writeQuotaExport,
@@ -142,6 +143,73 @@ describe("resolveExportPath", () => {
     ["~/literal\\name.json", join(homedir(), "literal\\name.json")],
   ])("resolves %j to %j", (input, expected) => {
     expect(resolveExportPath(input)).toBe(expected);
+  });
+
+  describe("with a non-default Claude account", () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it("gives the default export its own file", () => {
+      vi.stubEnv("CLAUDE_CONFIG_DIR", join(homedir(), ".claude-work"));
+      expect(resolveExportPath("")).toBe(join(folders.cacheDir, "quota-export.claude-work.json"));
+    });
+
+    it("keeps the shared file for the default ~/.claude folder", () => {
+      vi.stubEnv("CLAUDE_CONFIG_DIR", join(homedir(), ".claude"));
+      expect(resolveExportPath("")).toBe(testPaths.defaultExport);
+    });
+
+    it("leaves a configured path as it is", () => {
+      vi.stubEnv("CLAUDE_CONFIG_DIR", join(homedir(), ".claude-work"));
+      expect(resolveExportPath("/etc/opencode/export.json")).toBe("/etc/opencode/export.json");
+    });
+  });
+});
+
+describe("claudeAccountScope", () => {
+  it.each([
+    [undefined, ""],
+    ["", ""],
+    ["   ", ""],
+    [join(homedir(), ".claude"), ""],
+    ["~/.claude", ""],
+    ["~\\.claude\\", ""],
+    [join(homedir(), ".claude") + "/", ""],
+    [join(homedir(), ".claude", "..", ".claude"), ""],
+    [relative(process.cwd(), join(homedir(), ".claude")), ""],
+    [join(homedir(), ".CLAUDE"), process.platform === "win32" ? "" : "claude"],
+    [join(homedir(), ".claude-work"), "claude-work"],
+    ["~/.claude-work/", "claude-work"],
+    ["~\\.claude-work\\", "claude-work"],
+    ["./.claude-work/", "claude-work"],
+    [join(homedir(), "Claude Team!"), "claude-team"],
+    [join(homedir(), "Équipe 工作"), "quipe"],
+    [join(homedir(), "工作"), "custom"],
+    [join(homedir(), "!!!"), "custom"],
+    [parse(homedir()).root, "custom"],
+    [join(homedir(), "..."), "custom"],
+  ])("maps CLAUDE_CONFIG_DIR %j to %j", (value, expected) => {
+    expect(
+      claudeAccountScope(value === undefined ? {} : { CLAUDE_CONFIG_DIR: value }, homedir()),
+    ).toBe(expected);
+  });
+
+  it("expands a bare tilde using the supplied home", () => {
+    const home = join(homedir(), "account-home");
+    expect(claudeAccountScope({ CLAUDE_CONFIG_DIR: "~" }, home)).toBe("account-home");
+  });
+
+  it("uses the supplied home to identify the default folder", () => {
+    const home = join(homedir(), "account-home");
+    expect(claudeAccountScope({ CLAUDE_CONFIG_DIR: join(home, ".claude") }, home)).toBe("");
+    expect(claudeAccountScope({ CLAUDE_CONFIG_DIR: "~/.claude" }, home)).toBe("");
+  });
+
+  it("shares a filename for folder names that sanitize to the same scope", () => {
+    const scope = (directory: string) => claudeAccountScope({ CLAUDE_CONFIG_DIR: directory });
+    expect(scope(join(homedir(), "one", ".Claude Team"))).toBe("claude-team");
+    expect(scope(join(homedir(), "two", "claude-team"))).toBe("claude-team");
   });
 });
 

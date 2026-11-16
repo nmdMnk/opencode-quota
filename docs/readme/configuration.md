@@ -130,7 +130,7 @@ Every place follows these, so in the TUI they are on **Layout → All places**. 
 | Setting | Default | Values |
 | --- | --- | --- |
 | `system.exportFile` | `false` | Write quota JSON when the snapshot changes. See [External integration](external-integration.md). |
-| `system.exportPath` | `""` | Empty uses `$XDG_CACHE_HOME/opencode/quota-export.json`; otherwise an absolute or `~/` path without `..`. File only. |
+| `system.exportPath` | `""` | Empty uses `$XDG_CACHE_HOME/opencode/quota-export.json`, or `quota-export.<account>.json` for a non-default `CLAUDE_CONFIG_DIR` (sanitized folder name; collisions can share a file). See [External integration](external-integration.md#2-read-an-export-file). Explicit paths are not account-scoped: use an absolute or `~/` path without `..`. File only. |
 | `system.telemetry` | `false` | Publish quota and cache-age metrics through OpenCode's global OpenTelemetry MeterProvider. |
 | `system.oldCommands` | `true` | List the 4.x and 5.x `/tokens_*` commands, each `/quota_usage` on its range. |
 
